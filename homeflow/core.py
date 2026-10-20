@@ -322,7 +322,7 @@ def risk_check(identity, accept_legacy):
                       '才可使用 --accept-legacy-layout 实验写入；这不代表已验证兼容。')
 
 
-async def verified_write(phone, expected, target, directory, accept_legacy=False, accept_widgets=False, allow_dock=False):
+async def verified_write(phone, expected, target, directory, accept_legacy=False, accept_widgets=False, allow_dock=False, context=None):
     """Always journal first. Never blindly retry an ambiguous device write."""
     validate_layout(target, allow_widgets=accept_widgets)
     risk_check(phone.identity, accept_legacy)
@@ -337,6 +337,8 @@ async def verified_write(phone, expected, target, directory, accept_legacy=False
                'identity': phone.identity, 'before': envelope(current),
                'target': envelope(target), 'status': 'prepared',
                'verification_scope': 'legacy getIconState formatVersion=2 only'}
+    if context is not None:
+        journal['context'] = context
     save_json(path, journal)
     if current == target:
         journal['status'] = 'unchanged'

@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import core, planner
+from . import core, planner, history
 
 WEB = Path(__file__).with_name('web')
 
@@ -62,7 +62,7 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=['GET', 'POST'],
                        allow_headers=['Authorization', 'Content-Type'], allow_private_network=True)
     lock = asyncio.Lock()
-    snapshots, plans, transactions = {}, {}, {}
+    snapshots, plans = {}, {}
 
     @app.middleware('http')
     async def guard(request: Request, call_next):
@@ -96,7 +96,7 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
 
     @app.get('/api/health')
     async def health():
-        return {'name': 'HomeFlow', 'version': '0.2.0', 'personalization': True}
+        return {'name': 'HomeFlow', 'version': '0.3.0', 'personalization': True, 'undo_history': True}
 
     @app.post('/api/capture')
     async def capture():
@@ -139,28 +139,39 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
             async with await open_phone() as phone:
                 core.identity_check(snap['identity'], phone.identity)
                 journal, path = await core.verified_write(phone, core.unpack(snap['state']), after,
-                    data_dir / body.plan_id.hex, accept_legacy=True, accept_widgets=True)
-                tid = uuid.uuid4().hex
-                transactions[tid] = path
+                    data_dir / body.plan_id.hex, accept_legacy=True, accept_widgets=True,
+                    context={'operation': 'apply'})
+                tid = path.stem.removeprefix('transaction-')
                 return {'status': journal['status'], 'transaction_id': tid, 'layout': public_layout(after)}
+
+    @app.get('/api/history')
+    async def history_list():
+        async with lock:
+            async with await open_phone() as phone:
+                current = await phone.read()
+                records = await asyncio.to_thread(history.read_records, data_dir)
+                return {'records': history.list_for_phone(records, phone.identity, current)}
+
+    @app.post('/api/restore-preview')
+    async def restore_preview(body: RestoreInput):
+        async with lock:
+            async with await open_phone() as phone:
+                current = await phone.read()
+                record = history.eligible_record(data_dir, body.transaction_id.hex, phone.identity, current)
+                return {'transaction_id': body.transaction_id.hex, 'created_utc': record.get('created_utc', ''),
+                        'current': public_layout(current), 'restored': public_layout(core.unpack(record['before']))}
 
     @app.post('/api/restore')
     async def restore(body: RestoreInput):
         if not body.accept_layout_risk:
             raise HTTPException(400, '请确认恢复影响。')
         async with lock:
-            path = transactions.get(body.transaction_id.hex)
-            if not path:
-                raise HTTPException(404, '本次连接没有可恢复记录。历史快照请使用本机命令行恢复。')
-            import json
-            journal = json.loads(path.read_text(encoding='utf-8'))
-            if journal['status'] not in ('verified_legacy_layout', 'unchanged'):
-                raise core.Blocked('上次写入未通过核对，需要人工检查本机记录。')
             async with await open_phone() as phone:
-                core.identity_check(journal['identity'], phone.identity)
+                current = await phone.read()
+                journal = history.eligible_record(data_dir, body.transaction_id.hex, phone.identity, current)
                 restored, _ = await core.verified_write(phone, core.unpack(journal['target']),
-                    core.unpack(journal['before']), data_dir / 'restore', accept_legacy=True, accept_widgets=True)
-                transactions.pop(body.transaction_id.hex)
+                    core.unpack(journal['before']), data_dir / 'restore', accept_legacy=True, accept_widgets=True,
+                    context={'operation': 'undo', 'undo_of': body.transaction_id.hex})
                 return {'status': restored['status'], 'layout': public_layout(core.unpack(journal['before']))}
 
     @app.get('/')
