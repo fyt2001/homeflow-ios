@@ -176,3 +176,102 @@ def build(state, favorites=None, category_minutes=None):
         metadata['category_mapping_is_inference'] = True
     return target, metadata
 
+
+def personalize(state, favorites=(), *, hand='right', style='mixed', goal='speed',
+                favorite_limit=8, avoid=(), grouping='task', widgets='preserve'):
+    """User-selected preferences. Widget proposals remain review-only."""
+    if hand not in ('left', 'right', 'both') or style not in ('compact', 'mixed', 'spread'):
+        raise o.Blocked('不支持的排列偏好。')
+    if goal not in ('speed', 'calm', 'familiar') or grouping not in ('task', 'original'):
+        raise o.Blocked('不支持的整理目标或分组方式。')
+    if widgets not in ('preserve', 'review', 'replan') or favorite_limit not in (4, 8, 16):
+        raise o.Blocked('不支持的小组件偏好或常用数量。')
+    o.validate_layout(state, allow_widgets=True)
+    widget_count = sum(o.item_kind(a) in ('widget', 'widget_stack') for p in state for a in p)
+    notes = ['首页与底部固定应用栏保持原样；预览仅示意传统网格，不重建自由位置。']
+    review_only = widgets != 'preserve' and widget_count > 0
+    if review_only:
+        notes.append('小组件移动、删除及尺寸调整尚未验证；当前方案仅供评估，不能自动应用。切回“保留原样”可应用图标方案。')
+    if widgets == 'review' and widget_count:
+        notes.append(f'检测到 {widget_count} 个小组件或堆叠：建议在手机上逐个确认是否每天使用，再决定保留或精简。')
+    if widgets == 'replan' and widget_count:
+        notes.append('组件规划建议：信息展示类靠上，交互类靠近常用手一侧；具体位置请在手机上调整后重新读取。')
+    if goal == 'familiar':
+        return copy.deepcopy(state), {'preferences': dict(hand=hand, style=style, goal=goal,
+            favorite_limit=favorite_limit, grouping=grouping, widgets=widgets),
+            'review_only': review_only, 'notes': notes + ['保留熟悉感：本次不移动任何内容。'], 'moved': 0}
+    # Freeze later widget pages at their exact indices; organize each intervening
+    # segment separately so widgets never move when the number of pages changes.
+    locked = [i for i, page in enumerate(state) if i >= 2 and
+              any(o.item_kind(a) in ('widget', 'widget_stack') for a in page)]
+    if locked:
+        raise o.Blocked('后续页包含小组件。目前可选择“保留熟悉感”查看原布局；跨组件页面整理尚不支持。')
+    groups = defaultdict(list)
+    all_apps = []
+    for page in state[2:]:
+        for item in page:
+            source = item.get('displayName', '') if o.item_kind(item) == 'folder' else ''
+            members = [a for p in item['iconLists'] for a in p] if o.item_kind(item) == 'folder' else [item]
+            for a in members:
+                if o.item_kind(a) != 'app':
+                    raise o.Blocked('可编辑区域存在不支持的元素。')
+                a = copy.deepcopy(a)
+                all_apps.append(a)
+                category = (source or '其他应用') if grouping == 'original' else category_for(a, source)[0]
+                groups[category].append(a)
+    avoid = set(avoid)
+    requested = list(dict.fromkeys(favorites))
+    rank = {identifier: i for i, identifier in enumerate(requested) if identifier not in avoid}
+    def score(a):
+        return (2 if o.app_id(a) in avoid else 0 if o.app_id(a) in rank else 1,
+                rank.get(o.app_id(a), 999))
+    limit = min(favorite_limit, 4) if style == 'compact' else favorite_limit
+    if style == 'spread':
+        items = sorted(all_apps, key=score)
+    else:
+        promoted = []
+        for identifier in requested:
+            if identifier in avoid or len(promoted) >= limit:
+                continue
+            for members in groups.values():
+                pos = next((i for i, a in enumerate(members) if o.app_id(a) == identifier), None)
+                if pos is not None:
+                    promoted.append(members.pop(pos))
+                    break
+        ordinary, distracting = [], []
+        for name, members in groups.items():
+            regular = [a for a in members if o.app_id(a) not in avoid]
+            distracting.extend(a for a in members if o.app_id(a) in avoid)
+            for offset in range(0, len(regular), 135):
+                chunk = sorted(regular, key=score)[offset:offset+135]
+                ordinary.append({'listType': 'folder', 'displayName': name if offset == 0 else f'{name} {offset//135+1}',
+                    'iconLists': [chunk[i:i+9] for i in range(0, len(chunk), 9)]})
+        items = promoted + ordinary
+        for offset in range(0, len(distracting), 135):
+            chunk = distracting[offset:offset+135]
+            items.append({'listType': 'folder', 'displayName': '少打开' if offset == 0 else f'少打开 {offset//135+1}',
+                          'iconLists': [chunk[i:i+9] for i in range(0, len(chunk), 9)]})
+    target = copy.deepcopy(state[:2])
+    for start in range(0, len(items), 24):
+        chunk = items[start:start+24]
+        # Compact lists cannot encode free bottom whitespace. Rank only occupied
+        # slots; left/right choices still affect horizontal order on short pages.
+        anchor = {'left': 1.5, 'right': 3.5, 'both': 2.5}[hand]
+        rows = (len(chunk)+3)//4
+        slots = sorted(range(len(chunk)), key=lambda i: ((i//4+1-(rows-.6))/1.7)**2 + ((i%4+1-anchor)/1.4)**2)
+        output = [None]*len(chunk)
+        for a, slot in zip(chunk, slots):
+            output[slot] = a
+        target.append(output)
+    o.validate_transition(state, target)
+    unavailable = [identifier for identifier in requested if not any(o.app_id(a) == identifier for a in all_apps)]
+    if unavailable:
+        notes.append('部分常用应用位于被保护页面或底部固定栏，本次保留原位。')
+    if goal == 'calm':
+        notes.append('减少分心不会根据使用时长猜测；仅对你标记“希望少打开”的应用降低入口优先级。')
+    if not avoid:
+        notes.append('尚未标记“希望少打开”的应用；不会擅自隐藏娱乐或社交应用。')
+    return target, {'preferences': dict(hand=hand, style=style, goal=goal, favorite_limit=favorite_limit,
+        grouping=grouping, widgets=widgets), 'review_only': review_only, 'notes': notes,
+        'frequency_source': 'user_rank_not_telemetry', 'favorites_not_on_editable_pages': unavailable}
+

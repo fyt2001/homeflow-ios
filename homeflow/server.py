@@ -9,6 +9,7 @@ from pathlib import Path
 import secrets
 import uuid
 import webbrowser
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +37,13 @@ def public_layout(state):
 class PlanInput(BaseModel):
     snapshot_id: uuid.UUID
     favorites: list[str] = Field(default_factory=list, max_length=24)
+    hand: Literal['left', 'right', 'both'] = 'right'
+    style: Literal['compact', 'mixed', 'spread'] = 'mixed'
+    goal: Literal['speed', 'calm', 'familiar'] = 'speed'
+    favorite_limit: Literal[4, 8, 16] = 8
+    grouping: Literal['task', 'original'] = 'task'
+    widgets: Literal['preserve', 'review', 'replan'] = 'preserve'
+    avoid: list[str] = Field(default_factory=list, max_length=200)
 
 
 class WriteInput(BaseModel):
@@ -88,7 +96,7 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
 
     @app.get('/api/health')
     async def health():
-        return {'name': 'HomeFlow', 'version': '0.1.0'}
+        return {'name': 'HomeFlow', 'version': '0.2.0', 'personalization': True}
 
     @app.post('/api/capture')
     async def capture():
@@ -110,11 +118,12 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
             if not snap:
                 raise HTTPException(404, '读取记录已过期，请重新读取。')
             before = core.unpack(snap['state'])
-            after, metadata = planner.build(before, favorites=body.favorites)
+            after, metadata = planner.personalize(before, **body.model_dump(exclude={'snapshot_id'}))
             pid = uuid.uuid4().hex
-            plans[pid] = (snap, after)
+            plans[pid] = (snap, after, metadata['review_only'])
             core.save_json(data_dir / pid / 'plan.json', {'snapshot': snap, 'target': core.envelope(after), 'metadata': metadata})
-            return {'plan_id': pid, 'layout': public_layout(after), 'summary': core.layout_summary(after)}
+            return {'plan_id': pid, 'layout': public_layout(after), 'summary': core.layout_summary(after),
+                    'review_only': metadata['review_only'], 'notes': metadata['notes']}
 
     @app.post('/api/apply')
     async def apply(body: WriteInput):
@@ -124,7 +133,9 @@ def create_app(token: str, data_dir: Path, origins: list[str]):
             stored = plans.pop(body.plan_id.hex, None)
             if not stored:
                 raise HTTPException(404, '方案不存在或已使用，请重新生成。')
-            snap, after = stored
+            snap, after, review_only = stored
+            if review_only:
+                raise core.Blocked('小组件评估方案不能自动写入，请选择保留原样后重新生成。')
             async with await open_phone() as phone:
                 core.identity_check(snap['identity'], phone.identity)
                 journal, path = await core.verified_write(phone, core.unpack(snap['state']), after,
